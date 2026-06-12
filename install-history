@@ -1,0 +1,379 @@
+#!/usr/bin/env fish
+
+set days 3
+set mode "installed"
+set filter "all"
+
+set pacman_log "/var/log/pacman.log"
+set entries_file (mktemp)
+
+set color_reset (set_color normal)
+set color_title (set_color --bold cyan)
+set color_dim (set_color brblack)
+set color_date (set_color --bold white)
+set color_cachy (set_color blue)
+set color_arch (set_color green)
+set color_aur (set_color yellow)
+set color_flatpak (set_color magenta)
+set color_warn (set_color red)
+
+set -g REPO_CACHE_KEYS
+set -g REPO_CACHE_VALUES
+
+function cleanup
+    rm -f "$entries_file"
+end
+
+function usage
+    echo "Usage:"
+    echo "  install-history [days] [option]"
+    echo
+    echo "Examples:"
+    echo "  install-history"
+    echo "  install-history 4"
+    echo "  install-history 7 --all"
+    echo "  install-history 7 --important"
+    echo "  install-history 7 --aur"
+    echo "  install-history 7 --flatpak"
+    echo
+    echo "Options:"
+    echo "  --installed    Show installs only (default)"
+    echo "  --all          Show installs, upgrades, removals, reinstalls"
+    echo "  --important    Show only important system/gaming related packages"
+    echo "  --aur          Show only AUR/local packages"
+    echo "  --flatpak      Show only Flatpak history"
+    echo "  --help         Show this help"
+end
+
+for arg in $argv
+    switch "$arg"
+        case --help -h
+            usage
+            cleanup
+            exit 0
+
+        case --installed
+            set mode "installed"
+
+        case --all
+            set mode "all"
+
+        case --important
+            set mode "all"
+            set filter "important"
+
+        case --aur
+            set filter "aur"
+
+        case --flatpak
+            set filter "flatpak"
+
+        case '*'
+            if string match -qr '^[0-9]+$' -- "$arg"
+                set days "$arg"
+            else
+                echo "Unknown argument: $arg"
+                echo
+                usage
+                cleanup
+                exit 1
+            end
+    end
+end
+
+if not string match -qr '^[0-9]+$' -- "$days"
+    echo "Days must be a number."
+    cleanup
+    exit 1
+end
+
+set since_date (date -d "$days days ago" "+%Y-%m-%d")
+
+function source_color --argument-names source
+    switch "$source"
+        case CACHY
+            echo "$color_cachy"
+        case ARCH
+            echo "$color_arch"
+        case AUR/LOC
+            echo "$color_aur"
+        case FLATPAK
+            echo "$color_flatpak"
+        case '*'
+            echo "$color_arch"
+    end
+end
+
+function action_symbol --argument-names action
+    switch "$action"
+        case installed
+            echo "+"
+        case upgraded
+            echo "↑"
+        case removed
+            echo "-"
+        case reinstalled
+            echo "↻"
+        case '*'
+            echo "?"
+    end
+end
+
+function normalize_repo_source --argument-names repo
+    set repo_lower (string lower -- "$repo")
+
+    if test -z "$repo_lower"
+        echo "AUR/LOC"
+        return
+    end
+
+    if string match -qri '^cachy|^cachyos|cachyos-' -- "$repo_lower"
+        echo "CACHY"
+        return
+    end
+
+    echo "ARCH"
+end
+
+function get_pacman_source --argument-names pkg
+    set idx (contains -i -- "$pkg" $REPO_CACHE_KEYS)
+
+    if test -n "$idx"
+        echo $REPO_CACHE_VALUES[$idx]
+        return
+    end
+
+    set source "AUR/LOC"
+    set repo (env LC_ALL=C pacman -Si -- "$pkg" 2>/dev/null | awk -F ': +' '/^Repository/ {print $2; exit}')
+
+    if test -n "$repo"
+        set source (normalize_repo_source "$repo")
+    end
+
+    set -ga REPO_CACHE_KEYS "$pkg"
+    set -ga REPO_CACHE_VALUES "$source"
+
+    echo "$source"
+end
+
+function is_important_pkg --argument-names pkg
+    string match -qri 'linux|kernel|nvidia|mesa|vulkan|dxvk|vkd3d|wine|proton|steam|gamescope|mangohud|wayland|xwayland|kwin|plasma|kde|pipewire|wireplumber|alsa|pulseaudio|sddm|systemd|glibc|gcc|llvm|python|qt5|qt6|flatpak|xdg-desktop-portal|openxr|monado|vr' -- "$pkg"
+end
+
+function important_note --argument-names pkg
+    if string match -qri 'nvidia|mesa|vulkan|dxvk|vkd3d' -- "$pkg"
+        echo "graphics"
+    else if string match -qri 'linux|kernel' -- "$pkg"
+        echo "kernel"
+    else if string match -qri 'wine|proton|steam|gamescope|mangohud' -- "$pkg"
+        echo "gaming"
+    else if string match -qri 'kwin|plasma|kde|wayland|xwayland|sddm' -- "$pkg"
+        echo "desktop"
+    else if string match -qri 'pipewire|wireplumber|alsa|pulseaudio' -- "$pkg"
+        echo "audio"
+    else if string match -qri 'systemd|glibc|gcc|llvm|python|qt5|qt6' -- "$pkg"
+        echo "core"
+    else if string match -qri 'flatpak|xdg-desktop-portal' -- "$pkg"
+        echo "portal"
+    else if string match -qri 'openxr|monado|vr' -- "$pkg"
+        echo "VR"
+    else
+        echo "important"
+    end
+end
+
+function add_entry --argument-names date time source action pkg pkgver note
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$date" "$time" "$source" "$action" "$pkg" "$pkgver" "$note" >> "$entries_file"
+end
+
+if test "$filter" != "flatpak"
+    if not test -f "$pacman_log"
+        echo "Pacman log not found at: $pacman_log"
+        cleanup
+        exit 1
+    end
+
+    awk -v since="$since_date" -v mode="$mode" '
+        /^\[/ {
+            date = substr($1, 2, 10)
+            time = substr($1, 13, 5)
+
+            if (date < since)
+                next
+
+            action = ""
+
+            if (index($0, "[ALPM] installed ") > 0)
+                action = "installed"
+            else if (index($0, "[ALPM] upgraded ") > 0)
+                action = "upgraded"
+            else if (index($0, "[ALPM] removed ") > 0)
+                action = "removed"
+            else if (index($0, "[ALPM] reinstalled ") > 0)
+                action = "reinstalled"
+            else
+                next
+
+            if (mode == "installed" && action != "installed")
+                next
+
+            item = $0
+            sub(/^\[[^]]+\] \[ALPM\] [a-z]+ /, "", item)
+
+            pkg = item
+            sub(/ .*/, "", pkg)
+
+            pkgver = item
+            sub(/^[^ ]+ /, "", pkgver)
+
+            print date "\t" time "\t" action "\t" pkg "\t" pkgver
+        }
+    ' "$pacman_log" | while read -l line
+        set parts (string split \t "$line")
+
+        set date "$parts[1]"
+        set time "$parts[2]"
+        set action "$parts[3]"
+        set pkg "$parts[4]"
+        set pkgver "$parts[5]"
+
+        set source (get_pacman_source "$pkg")
+
+        if test "$filter" = "aur"; and test "$source" != "AUR/LOC"
+            continue
+        end
+
+        if test "$filter" = "important"; and not is_important_pkg "$pkg"
+            continue
+        end
+
+        set note ""
+        if is_important_pkg "$pkg"
+            set note (important_note "$pkg")
+        end
+
+        add_entry "$date" "$time" "$source" "$action" "$pkg" "$pkgver" "$note"
+    end
+end
+
+if command -q flatpak; and test "$filter" != "aur"; and test "$filter" != "important"
+    flatpak history --since="$since_date" 2>/dev/null | while read -l line
+        if string match -qr '^(Time|time|ID|id)[[:space:]]' -- "$line"
+            continue
+        end
+
+        if test -z "$line"
+            continue
+        end
+
+        set lower (string lower -- "$line")
+        set action ""
+
+        if string match -q '*install*' -- "$lower"
+            set action "installed"
+        else if string match -q '*update*' -- "$lower"
+            set action "upgraded"
+        else if string match -q '*remove*' -- "$lower"
+            set action "removed"
+        else
+            continue
+        end
+
+        set date (string sub -s 1 -l 10 -- "$line")
+        set time (string sub -s 12 -l 5 -- "$line")
+
+        if not string match -qr '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' -- "$date"
+            set date "FLATPAK"
+            set time "--:--"
+        end
+
+        if not string match -qr '^[0-9]{2}:[0-9]{2}$' -- "$time"
+            set time "--:--"
+        end
+
+        add_entry "$date" "$time" "FLATPAK" "$action" "$line" "" ""
+    end
+end
+
+set total (awk 'END {print NR + 0}' "$entries_file")
+set cachy_count (awk -F '\t' '$3 == "CACHY" {c++} END {print c + 0}' "$entries_file")
+set arch_count (awk -F '\t' '$3 == "ARCH" {c++} END {print c + 0}' "$entries_file")
+set aur_count (awk -F '\t' '$3 == "AUR/LOC" {c++} END {print c + 0}' "$entries_file")
+set flatpak_count (awk -F '\t' '$3 == "FLATPAK" {c++} END {print c + 0}' "$entries_file")
+set important_count (awk -F '\t' '$7 != "" {c++} END {print c + 0}' "$entries_file")
+
+echo "$color_title""Install History""$color_reset"
+echo "$color_dim""Last $days days • since $since_date""$color_reset"
+echo
+
+echo "$color_title""Summary""$color_reset"
+printf "  %-11s %s\n" "Total:" "$total"
+printf "  %-11s %s%s%s\n" "CachyOS:" "$color_cachy" "$cachy_count" "$color_reset"
+printf "  %-11s %s%s%s\n" "Arch:" "$color_arch" "$arch_count" "$color_reset"
+printf "  %-11s %s%s%s\n" "AUR/Local:" "$color_aur" "$aur_count" "$color_reset"
+printf "  %-11s %s%s%s\n" "Flatpak:" "$color_flatpak" "$flatpak_count" "$color_reset"
+printf "  %-11s %s%s%s\n" "Important:" "$color_warn" "$important_count" "$color_reset"
+
+if test "$total" -eq 0
+    echo
+    echo "No matching history found."
+    cleanup
+    exit 0
+end
+
+echo
+
+set last_date ""
+
+sort "$entries_file" | while read -l line
+    set parts (string split \t "$line")
+
+    set date "$parts[1]"
+    set time "$parts[2]"
+    set source "$parts[3]"
+    set action "$parts[4]"
+    set pkg "$parts[5]"
+    set pkgver "$parts[6]"
+    set note "$parts[7]"
+
+    if test "$date" != "$last_date"
+        if test -n "$last_date"
+            echo
+        end
+
+        echo "$color_date""$date""$color_reset"
+        set last_date "$date"
+    end
+
+    set src_color (source_color "$source")
+    set symbol (action_symbol "$action")
+
+    set suffix ""
+
+    if test "$mode" = "all"; and test "$action" != "installed"
+        set suffix "$suffix $color_dim"[$action]"$color_reset"
+    end
+
+    if test -n "$note"
+        set suffix "$suffix $color_warn"[$note]"$color_reset"
+    end
+
+    if test -n "$pkgver"
+        printf "  %-2s %s%-9s%s %-5s %s %s%s\n" \
+            "$symbol" \
+            "$src_color" "[$source]" "$color_reset" \
+            "$time" \
+            "$pkg" \
+            "$pkgver" \
+            "$suffix"
+    else
+        printf "  %-2s %s%-9s%s %-5s %s%s\n" \
+            "$symbol" \
+            "$src_color" "[$source]" "$color_reset" \
+            "$time" \
+            "$pkg" \
+            "$suffix"
+    end
+end
+
+cleanup
